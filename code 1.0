@@ -1,0 +1,210 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : 线性CCD高速边缘计算系统 (手术刀头亚像素级测距)
+  * @note           : 摒弃繁重协议，MCU直算中心点，极速输出 ASCII 坐标
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "adc.h"
+#include "usart.h"
+#include "gpio.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+/* USER CODE END Includes */
+
+/* Private variables ---------------------------------------------------------*/
+/* USER CODE BEGIN PV */
+uint16_t ccd_raw[128];       // 物理弹药库：原始ADC电压值
+char     serial_buf[128];    // 通信弹药库：极简 ASCII 字符串缓冲区 (足够容纳 "Center: xx.x")
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+/* USER CODE BEGIN PFP */
+
+/**
+ * @brief CCD 微秒级驱动延时
+ */
+void CCD_Delay(void) {
+    for(int i = 0; i < 5; i++) {
+        __NOP(); 
+    }
+}
+
+/**
+ * @brief 核心战术：采集 -> 极值扫描 -> 阈值二值化 -> 提取边缘 -> 算出中心点并发射
+ */
+void CCD_Capture_And_Send(void) {
+    
+    // --------------------------------------------------
+    // 1. 硬件驱动阶段：极速采集 128 像素
+    // --------------------------------------------------
+    HAL_GPIO_WritePin(CCD_SI_GPIO_Port, CCD_SI_Pin, GPIO_PIN_SET);   
+    CCD_Delay();
+    HAL_GPIO_WritePin(CCD_CLK_GPIO_Port, CCD_CLK_Pin, GPIO_PIN_SET); 
+    CCD_Delay();
+    HAL_GPIO_WritePin(CCD_SI_GPIO_Port, CCD_SI_Pin, GPIO_PIN_RESET); 
+    CCD_Delay();
+    HAL_GPIO_WritePin(CCD_CLK_GPIO_Port, CCD_CLK_Pin, GPIO_PIN_RESET);
+    
+    for(int i = 0; i < 128; i++) {
+        HAL_ADC_Start(&hadc1);                     
+        HAL_ADC_PollForConversion(&hadc1, 1);      
+        ccd_raw[i] = HAL_ADC_GetValue(&hadc1);     
+        
+        HAL_GPIO_WritePin(CCD_CLK_GPIO_Port, CCD_CLK_Pin, GPIO_PIN_SET); 
+        CCD_Delay();
+        HAL_GPIO_WritePin(CCD_CLK_GPIO_Port, CCD_CLK_Pin, GPIO_PIN_RESET);
+        CCD_Delay();
+    }
+    
+    // --------------------------------------------------
+    // 2. 边缘计算阶段：算法提纯
+    // --------------------------------------------------
+    uint16_t max_val = 0;
+    uint16_t min_val = 4095;
+    
+    // 步骤A: 扫描当前物理极值 (寻找白纸最亮与刀头最暗)
+    for(int i = 0; i < 128; i++) {
+        if(ccd_raw[i] > max_val) max_val = ccd_raw[i];
+        if(ccd_raw[i] < min_val) min_val = ccd_raw[i];
+    }
+    if(max_val == min_val) max_val = min_val + 1; 
+
+    // 步骤B: 自适应动态阈值计算 (黄金分割切割线)
+    // 取最亮与最暗的中值作为判断刀头边缘的绝对标准
+    uint16_t threshold = min_val + (max_val - min_val) / 2;
+    
+    int left_edge = -1;
+    int right_edge = -1;
+    
+    // 步骤C: 边缘索敌
+    // 从左向右找，第一个光线跌破阈值的点 = 刀头左边缘
+    for(int i = 0; i < 128; i++) {
+        if(ccd_raw[i] < threshold) {
+            left_edge = i;
+            break;
+        }
+    }
+    
+    // 从右向左找，第一个光线跌破阈值的点 = 刀头右边缘
+    for(int i = 127; i >= 0; i--) {
+        if(ccd_raw[i] < threshold) {
+            right_edge = i;
+            break;
+        }
+    }
+    
+    // --------------------------------------------------
+    // 3. 通信阶段：只发射核心结果
+    // --------------------------------------------------
+    uint16_t ptr = 0;
+    
+    // 确保找到了完整阴影，排除干扰误判
+    if(left_edge != -1 && right_edge != -1 && right_edge >= left_edge) {
+        // 解算亚像素级几何中心坐标
+        float center = (left_edge + right_edge) / 2.0f;
+        // 格式化输出 (例如: "Center: 64.5\r\n")
+        ptr += sprintf(serial_buf, "Center: %.1f\r\n", center);
+    } else {
+        ptr += sprintf(serial_buf, "Lost\r\n"); // 视野内无刀头阴影
+    }
+    
+    // 串口发射：数据量暴降，仅需十几字节，无视串口阻塞瓶颈
+    HAL_UART_Transmit(&huart1, (uint8_t*)serial_buf, ptr, 10);
+}
+/* USER CODE END PFP */
+
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();
+  MX_GPIO_Init();
+  MX_ADC1_Init();
+  MX_USART1_UART_Init();
+
+  /* USER CODE BEGIN 2 */
+  // ADC 内置硬件校准
+  HAL_ADCEx_Calibration_Start(&hadc1);
+  
+  // 锁死初始物理电平
+  HAL_GPIO_WritePin(CCD_CLK_GPIO_Port, CCD_CLK_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(CCD_SI_GPIO_Port, CCD_SI_Pin, GPIO_PIN_RESET);
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    // 无限开火权：疯狂调用，压榨 CPU 算力
+    CCD_Capture_And_Send(); 
+    
+    // 【提速关键点】：解除封印！
+    // 仅保留 2 毫秒延时作为极其短暂的曝光积分时间。
+    // 如果环境光够亮，甚至可以把这句话删掉，直接飙到系统极限刷新率。
+    HAL_Delay(2); 
+  }
+  /* USER CODE END 3 */
+}
+
+// ---------------------------------------------------------
+// 时钟树与错误回调 (保持不动)
+// ---------------------------------------------------------
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+  }
+}
+#ifdef  USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif /* USE_FULL_ASSERT */
